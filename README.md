@@ -13,7 +13,7 @@ Two features on the `event` hook:
 ## Install
 
 ```bash
-npm install opencode-auto-bg
+npm install @ghilteras/opencode-auto-bg
 ```
 
 ## Configure
@@ -22,7 +22,7 @@ Add to your `opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["opencode-auto-bg"]
+  "plugin": ["@ghilteras/opencode-auto-bg"]
 }
 ```
 
@@ -32,7 +32,7 @@ The plugin auto-detects sessions whose parent agent is `"architect"`. To target 
 {
   "agent": {
     "config": {
-      "opencode-auto-bg": {
+      "@ghilteras/opencode-auto-bg": {
         "parentAgent": "build"
       }
     }
