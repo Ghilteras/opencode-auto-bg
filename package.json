@@ -21,6 +21,7 @@
   "main": "plugin.js",
   "files": [
     "plugin.js",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }
