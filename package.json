@@ -1,0 +1,15 @@
+{
+  "name": "opencode-auto-bg",
+  "version": "1.0.0",
+  "description": "Transparent automatic backgrounding for OpenCode subagents — no API changes, no new tools. Hooks into session.created to background architect's children, plus a wake safety net for the ~3% of cases where native wake fails.",
+  "keywords": ["opencode", "opencode-plugin", "subagent", "background", "async", "delegation", "architect"],
+  "license": "MIT",
+  "author": "Angelo Pantano <ghilteras@protonmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ghilteras/opencode-auto-bg.git"
+  },
+  "type": "module",
+  "main": "plugin.js",
+  "files": ["plugin.js", "README.md"]
+}
