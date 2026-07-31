@@ -50,6 +50,10 @@ The plugin auto-detects sessions whose parent agent is `"architect"`. To target 
 - `session.created` → polls child status every 200ms up to 10s. When the child becomes "busy", backgrounds the parent.
 - `session.idle` on a child → watches the parent for 5 minutes. If the parent stays idle without processing the task result, sends a wake message reusing the parent's last model to preserve prompt cache.
 
+## TUI vs OpenChamber
+
+In the TUI you can press `Ctrl+B` to manually background a subagent. OpenChamber (mobile/web client) has no such shortcut — without this plugin, every delegation blocks the interface until the subagent completes. If you use OpenChamber, auto-bg is essential; if you use the TUI, it's a convenient automation of what you'd do manually.
+
 ## Why?
 
 OpenCode's native subagent delegation keeps the parent in foreground until the child completes. The built-in background API exists but has to be called manually. This plugin makes it automatic and handles edge cases the native wake misses.
