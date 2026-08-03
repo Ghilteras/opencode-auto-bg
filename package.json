@@ -1,6 +1,6 @@
 {
   "name": "@ghilteras/opencode-auto-bg",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "Transparent automatic backgrounding for OpenCode subagents \u2014 no API changes, no new tools. Hooks into session.created to background architect's children, plus a wake safety net for the ~3% of cases where native wake fails.",
   "keywords": [
     "opencode",

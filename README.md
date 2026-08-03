@@ -8,7 +8,7 @@ Two features on the `event` hook:
 
 1. **Auto-background** (`session.created`) — when architect spawns a child subagent, this plugin polls until the child is busy, then calls `POST /experimental/session/<parentID>/background`. The parent goes idle immediately and the turn returns to the user. No more "delegating task..." hanging.
 
-2. **Wake safety net** (`session.idle`) — in ~3% of cases the native OpenCode wake fails to deliver the `<task_result>` back to the parent. This watchdog detects the gap and re-injects the wake with the parent's previous model to preserve prompt cache.
+2. **Wake safety net** (`session.idle`) — in ~3% of cases the native OpenCode wake fails to deliver the `<task_result>` back to the parent — or delivers it but the parent turn dies silently mid-step (step-finish reason="unknown", anomalyco#33066/#21524). This watchdog detects both gaps: it verifies the parent actually completed a turn after delivery (not just that the result is in the timeline), and re-wakes via the sync /session/:id/message route (prompt_async is unreliable for idle sessions) with the parent's previous model to preserve prompt cache.
 
 ## Install
 
@@ -48,7 +48,7 @@ The plugin auto-detects sessions whose parent agent is `"architect"`. To target 
 ## How it works
 
 - `session.created` → polls child status every 200ms up to 10s. When the child becomes "busy", backgrounds the parent.
-- `session.idle` on a child → watches the parent for 5 minutes. If the parent stays idle without processing the task result, sends a wake message reusing the parent's last model to preserve prompt cache.
+- `session.idle` on a child → watches the parent for 5 minutes. If the parent stays idle without processing the task result, verifies the parent actually completed its turn after delivery (liveness, not just delivery) and sends a wake message via the sync /message route, reusing the parent's last model to preserve prompt cache.
 
 ## TUI vs OpenChamber
 

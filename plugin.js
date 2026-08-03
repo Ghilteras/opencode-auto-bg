@@ -8,7 +8,7 @@
  *    busy, poi POST /experimental/session/<parentID>/background → il parent torna
  *    IDLE subito e il turno torna ad Angelo.
  *
- * 2) WAKE SAFETY NET (nuovo, 2026-07-27)
+ * 2) WAKE SAFETY NET (nuovo, 2026-07-27; esteso 2026-08-03)
  *    `session.idle` su un child → sorveglia il parent. Il wake NATIVO di opencode
  *    (task.ts inject → ops.prompt) ha già scritto il `<task ... state="completed">`
  *    nella timeline del parent; nella stragrande maggioranza dei casi fa partire
@@ -16,6 +16,12 @@
  *    parent è già Running — misurato ~3% su 536 deleghe), il messaggio resta lì
  *    non risposto per sempre: niente ri-scansiona i messaggi utente in coda.
  *    Questo watchdog se ne accorge e ri-lancia il turno.
+ *    INCIDENTE 2026-08-03 (anomalyco#33066/#21524): il wake nativo può consegnare
+ *    il result ma il turno del parent muore a metà (step-finish reason="unknown",
+ *    0 token, nessun errore) e la sessione resta idle per ore. Da questa versione
+ *    il watchdog verifica la COMPLETION del turno post-iniezione, non solo la
+ *    delivery, e usa /session/{id}/message (sync) al posto di prompt_async (che
+ *    su sessioni idle spesso non fa partire il turno).
  *
  * REGOLA D'ORO — NESSUN PIN DI MODELLO.
  *    Il wake DEVE girare con lo STESSO modello del turno precedente del parent,
@@ -55,6 +61,7 @@ const WAKE_GRACE_MS = 4000 // quanto lasciamo al wake nativo prima di guardare
 const WAKE_POLL_MS = 2000 // cadenza di sorveglianza del parent
 const WAKE_MAX_WAIT_MS = 300000 // 5 min: copre parent occupati a lungo (max osservato 78.6s)
 const WAKE_MAX_ATTEMPTS = 3 // ri-lanci prima di arrendersi
+const WAKE_POST_TIMEOUT_MS = 30000 // wake via /message sync: quanto aspettiamo la risposta (30s)
 
 const backgrounded = new Set() // childID già backgroundati
 const waked = new Set() // childID per cui il watchdog ha già girato
@@ -128,12 +135,16 @@ export default async () => {
     // Mai un default nostro, mai un pin: cambierebbe modello sotto il parent.
     if (model) body.model = model
 
+    // Route: /message sync (v1) e NON prompt_async — incidente 2026-08-03 + anomalyco#21524:
+    // prompt_async torna 204 ma spesso non fa partire il turno su sessioni idle. Il
+    // wake sync parte sempre; il timeout corto ci fa solo smettere di aspettare, il
+    // turno resta in esecuzione lato server.
     try {
-      const r = await fetch(`${OPENCODE_URL}/session/${parent.id}/prompt_async`, {
+      const r = await fetch(`${OPENCODE_URL}/session/${parent.id}/message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+        signal: AbortSignal.timeout(WAKE_POST_TIMEOUT_MS),
       })
       const ct = r.headers.get("content-type") || ""
       if (!r.ok || ct.includes("text/html")) {
@@ -152,7 +163,12 @@ export default async () => {
   }
 
   /**
-   * Cerca il <task id="childID" state="completed"> nei messaggi del parent.
+   * Cerca il <task id="childID" state="completed"> nei messaggi del parent e
+   * restituisce il TIMESTAMP (ms) del messaggio che lo contiene, oppure null.
+   * Serve a distinguere "result consegnato" (c'è) da "turno completato" (vedi
+   * parentTurnCompletedAfter) — incidente 2026-08-03: il wake nativo ha scritto il
+   * result, il turno del parent è morto a metà (step-finish reason="unknown", 0
+   * token) e la sessione è rimasta idle 6h. Delivery ≠ completion (anomalyco#33066).
    *
    * POSTMORTEM 2026-07-29 — la versione precedente aveva TRE bug:
    *   1. Usava m?.info?.parts (sempre vuoto) — le parti stanno in m?.parts
@@ -160,30 +176,56 @@ export default async () => {
    *   3. Non distingueva state="running" da state="completed"
    *   Conseguenza: restituiva sempre false → 3 wake per child → tripla notifica.
    */
-  const taskResultDelivered = async (parentID, childID) => {
+  const taskResultDeliveredAt = async (parentID, childID) => {
     const msgs = await getJson(`/session/${parentID}/message`)
-    if (!Array.isArray(msgs)) return false
+    if (!Array.isArray(msgs)) return null
     const needle = `<task id="${childID}"`
-    return msgs.some((m) => {
+    for (const m of msgs) {
       const parts = m?.parts || []
-      return parts.some((p) => {
+      for (const p of parts) {
+        let hit = false
         // Caso 1: delega iniziale (type="tool", tool="task", state="running" o "completed")
         if (p?.type === "tool" && p?.tool === "task") {
           const output = p?.state?.output || ""
           if (typeof output === "string" && output.includes(needle)) {
-            // Matcha SOLO se completato, non la delega iniziale state="running"
-            return output.includes(`state="completed"`)
+            hit = output.includes(`state="completed"`)
           }
         }
         // Caso 2: notifica di completamento nativa (type="text", synthetic=true)
-        if (p?.type === "text") {
+        if (!hit && p?.type === "text") {
           const text = p?.text || ""
           if (typeof text === "string" && text.includes(needle)) {
-            return text.includes(`state="completed"`)
+            hit = text.includes(`state="completed"`)
           }
         }
-        return false
-      })
+        if (hit) return m?.time?.created ?? m?.time_created ?? Date.now()
+      }
+    }
+    return null
+  }
+
+  /**
+   * Vero se il parent ha prodotto un turno assistant COMPLETATO dopo `afterMs`
+   * (ms): un messaggio con testo reale (non sintetico auto-bg) o una tool call.
+   * Un turno morto ha solo step-start/step-finish (reason="unknown") + reasoning,
+   * senza text né tool — questo check lo distingue da un turno riuscito.
+   */
+  const parentTurnCompletedAfter = async (parentID, parentAgent, afterMs) => {
+    const msgs = await getJson(`/session/${parentID}/message`)
+    if (!Array.isArray(msgs)) return false
+    return msgs.some((m) => {
+      if (m?.info?.role !== "assistant" || m?.info?.agent !== parentAgent) return false
+      const t = m?.time?.created ?? m?.time_created
+      if (!t || t < afterMs) return false
+      const parts = m?.parts || []
+      return parts.some(
+        (p) =>
+          (p?.type === "text" &&
+            typeof p?.text === "string" &&
+            p.text.trim().length > 0 &&
+            !p.text.startsWith("[auto-bg]")) ||
+          (p?.type === "tool" && !!p?.tool),
+      )
     })
   }
 
@@ -200,25 +242,37 @@ export default async () => {
     let attempts = 0
 
     while (Date.now() < deadline) {
-      if (await taskResultDelivered(parent.id, childID)) {
-        log(
-          attempts === 0
-            ? `parent ${parent.id}: task_result di child ${childID} già nella timeline (wake nativo ok)`
-            : `parent ${parent.id}: task_result di child ${childID} arrivato dopo wake #${attempts}`,
-        )
-        return
-      }
-
+      const deliveredAt = await taskResultDeliveredAt(parent.id, childID)
       const status = await getJson("/session/status")
       const st = status?.[parent.id]?.type
-      if (st === "busy" || st === "retry") {
-        // Il parent sta lavorando: il wake nativo è in coda dietro al run corrente
-        // e verrà consegnato alla fine (misurato fino a 78.6s). Non toccare nulla.
+
+      if (deliveredAt) {
+        // Il wake nativo ha scritto il result. Se il parent sta ancora lavorando,
+        // il turno è in corso (misurato fino a 78.6s): aspetta, non toccare.
+        if (st === "busy" || st === "retry") {
+          await sleep(WAKE_POLL_MS)
+          continue
+        }
+        // Parent IDLE con result consegnato: verifica che il turno sia DAVVERO
+        // completato (incidente 2026-08-03: result consegnato ma step morto a metà,
+        // reason="unknown" 0 token — delivery ≠ completion, anomalyco#33066/#21524).
+        if (await parentTurnCompletedAfter(parent.id, parent.agent, deliveredAt)) {
+          log(
+            attempts === 0
+              ? `parent ${parent.id}: task_result di child ${childID} consegnato e turno completato (wake nativo ok)`
+              : `parent ${parent.id}: turno di child ${childID} completato dopo wake #${attempts}`,
+          )
+          return
+        }
+        // Result consegnato ma turno morto → stesso trattamento di un wake mancato.
+        log(`parent ${parent.id}: task_result di child ${childID} consegnato ma turno NON completato → wake`)
+      } else if (st === "busy" || st === "retry") {
+        // Result non ancora arrivato e parent occupato: wake nativo in coda.
         await sleep(WAKE_POLL_MS)
         continue
       }
 
-      // Parent IDLE e nessun turno nuovo ⇒ il wake nativo è stato scartato.
+      // Parent IDLE: o il wake nativo è stato scartato, o il turno è morto.
       if (attempts >= WAKE_MAX_ATTEMPTS) {
         log(`parent ${parent.id}: ${attempts} tentativi falliti per child ${childID}, mi fermo`)
         return
