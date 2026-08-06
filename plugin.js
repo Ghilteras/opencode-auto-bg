@@ -1,7 +1,7 @@
 /**
- * auto-bg.ts — opencode plugin — AUTO-BACKGROUND + MODEL-PRESERVING WAKE SAFETY NET
+ * auto-bg.ts — opencode plugin — AUTO-BACKGROUND + MODEL-PRESERVING WAKE SAFETY NET + TODO-SYNC NUDGE
  *
- * DUE RESPONSABILITÀ, entrambe sull'hook `event`:
+ * TRE RESPONSABILITÀ, tutte sull'hook `event`:
  *
  * 1) BACKGROUND (invariato, collaudato 688/698 deleghe, 0 POST falliti)
  *    `session.created` con parentID e parent=architect → poll finché il child è
@@ -48,6 +48,17 @@
  *
  * Scope: solo deleghe il cui parent è `architect`. `build` e gli altri primari
  * restano intatti.
+ *
+ * 3) TODO-SYNC NUDGE (fork 2026-08-06; state-based 2026-08-06 v1.2.0)
+ *    `session.idle` su una sessione TOP-LEVEL con agent=architect (il parent stesso,
+ *    NON un child) → se la TODO ha task ancora `in_progress`, inietta un promemoria
+ *    meccanico a sincronizzarla. STATE-BASED, non tool-call-based: l'euristica
+ *    precedente ("ultimo turno ha usato tool senza todowrite") mancava i turni
+ *    text-only — il turno finale che dichiara "fatto" con in_progress pendenti.
+ *    Grace: se c'è una delega in volo (child busy) gli in_progress sono legittimi.
+ *    Convergence: se l'ultimo turno ha già chiamato `todowrite`, non insistere.
+ *    Cooldown 2min anti-loop. Questo rende la regola "TODO aggiornati a fine OGNI
+ *    turno" un trigger di sistema, non un'autodisciplina.
  */
 
 const OPENCODE_URL = "http://127.0.0.1:4097"
@@ -62,6 +73,10 @@ const WAKE_POLL_MS = 2000 // cadenza di sorveglianza del parent
 const WAKE_MAX_WAIT_MS = 300000 // 5 min: copre parent occupati a lungo (max osservato 78.6s)
 const WAKE_MAX_ATTEMPTS = 3 // ri-lanci prima di arrendersi
 const WAKE_POST_TIMEOUT_MS = 30000 // wake via /message sync: quanto aspettiamo la risposta (30s)
+
+const TODO_NUDGE_COOLDOWN_MS = 120000 // 2 min: niente doppio nudge ravvicinato
+const todoNudged = new Set() // sessionID già nudgati (cooldown)
+const childrenByParent = new Map() // parentID -> Set(childID) — per la grace di delega nel nudge
 
 const backgrounded = new Set() // childID già backgroundati
 const waked = new Set() // childID per cui il watchdog ha già girato
@@ -198,7 +213,7 @@ export default async () => {
             hit = text.includes(`state="completed"`)
           }
         }
-        if (hit) return m?.time?.created ?? m?.time_created ?? Date.now()
+        if (hit) return m?.info?.time?.created ?? m?.time?.created ?? m?.time_created ?? Date.now()
       }
     }
     return null
@@ -215,7 +230,7 @@ export default async () => {
     if (!Array.isArray(msgs)) return false
     return msgs.some((m) => {
       if (m?.info?.role !== "assistant" || m?.info?.agent !== parentAgent) return false
-      const t = m?.time?.created ?? m?.time_created
+      const t = m?.info?.time?.created ?? m?.time?.created ?? m?.time_created
       if (!t || t < afterMs) return false
       const parts = m?.parts || []
       return parts.some(
@@ -289,6 +304,82 @@ export default async () => {
     log(`parent ${parent.id}: watchdog scaduto per child ${childID}`)
   }
 
+  /**
+   * TODO-SYNC NUDGE — sessione top-level architect andata idle.
+   * STATE-BASED (v1.1.2): legge la TODO vera via GET /session/{id}/todo e nudge
+   * se ci sono task `in_progress`, con due guardie:
+   *  - delega in volo (child busy) → in_progress legittimi, niente nudge;
+   *  - convergence: ultimo turno ha già chiamato `todowrite` → niente nudge.
+   * Iniezione col meccanismo del wake: /session/{id}/message sync, modello del
+   * turno precedente, synthetic text.
+   */
+  const maybeNudgeTodo = async (sessionID) => {
+    if (todoNudged.has(sessionID)) return
+    const sess = await getJson(`/session/${sessionID}`)
+    if (!sess || sess.agent !== TRIGGER_PARENT_AGENT) return // solo architect top-level
+    if (sess.parentID) return // child: gestito dal watchdog, non qui
+
+    // STATE-BASED: la TODO vera, non i tool call dell'ultimo turno.
+    // (2026-08-06: l'euristica "tool senza todowrite" mancava i turni text-only —
+    // il turno finale che dichiara "fatto" con in_progress pendenti.)
+    const todos = await getJson(`/session/${sessionID}/todo`)
+    if (!Array.isArray(todos)) return
+    const inProgress = todos.filter((t) => t?.status === "in_progress")
+    if (inProgress.length === 0) return
+
+    // GRACE: se c'è una delega in volo (child busy), gli in_progress sono legittimi.
+    const kids = childrenByParent.get(sessionID)
+    if (kids && kids.size > 0) {
+      const status = await getJson("/session/status")
+      if (status) {
+        for (const cid of kids) {
+          const st = status?.[cid]?.type
+          if (st === "busy" || st === "retry") return // child attivo: aspetta
+        }
+      }
+    }
+
+    // CONVERGENCE: se l'ultimo turno ha già chiamato todowrite, il modello sta
+    // gestendo la TODO (o ha scelto di lasciarla in_progress) — non insistere.
+    const reals = (await realAssistantMessages(sessionID, TRIGGER_PARENT_AGENT)) || []
+    const last = reals[reals.length - 1]
+    const didTodo = last?.parts?.some((p) => p?.type === "tool" && p?.tool === "todowrite")
+    if (didTodo) return
+
+    todoNudged.add(sessionID)
+    setTimeout(() => todoNudged.delete(sessionID), TODO_NUDGE_COOLDOWN_MS)
+    const model = lastTurnModel(reals)
+    const body = {
+      agent: TRIGGER_PARENT_AGENT,
+      parts: [
+        {
+          type: "text",
+          synthetic: true,
+          text:
+            `[todo-sync] La sessione è andata idle con ${inProgress.length} task ancora in_progress nella TODO. ` +
+            `Se il lavoro è finito, chiama \`todowrite\` per chiuderli (completed/cancelled) PRIMA di rispondere.`,
+        },
+      ],
+    }
+    if (model) body.model = model
+    try {
+      const r = await fetch(`${OPENCODE_URL}/session/${sessionID}/message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(WAKE_POST_TIMEOUT_MS),
+      })
+      const ct = r.headers.get("content-type") || ""
+      if (!r.ok || ct.includes("text/html")) {
+        log(`todo-nudge POST sospetto: status=${r.status} ct=${ct}`)
+        return
+      }
+      log(`todo-sync: nudge inviato a ${sessionID} (${inProgress.length} task in_progress)`)
+    } catch (e) {
+      log(`todo-nudge POST fallito: ${String(e)}`)
+    }
+  }
+
   return {
     event: async ({ event }) => {
       try {
@@ -305,6 +396,10 @@ export default async () => {
           if (backgrounded.has(childID)) return
           if (backgrounded.size > 2000) backgrounded.clear()
           backgrounded.add(childID)
+          const kids = childrenByParent.get(parentID) || new Set()
+          kids.add(childID)
+          childrenByParent.set(parentID, kids)
+          if (childrenByParent.size > 200) childrenByParent.clear()
 
           const parent = await getJson(`/session/${parentID}`)
           if (parent?.agent !== TRIGGER_PARENT_AGENT) {
@@ -345,6 +440,12 @@ export default async () => {
           // session.idle porta SOLO sessionID: il parentID va risolto con una GET.
           const sessionID = event?.properties?.sessionID || event?.properties?.info?.id
           if (!sessionID) return
+          // Sessione top-level (architect stesso): nudge TODO se il turno ha usato tool senza todowrite
+          const maybeSess = await getJson(`/session/${sessionID}`)
+          if (maybeSess && !maybeSess.parentID) {
+            maybeNudgeTodo(sessionID).catch((e) => log(`todo-nudge err: ${String(e)}`))
+            return
+          }
           if (waked.has(sessionID)) return
           // FIX 2026-07-29: waked.add PRIMA degli await per chiudere la race condition
           // (due eventi ravvicinati entravano entrambi prima che il primo facesse l'add)

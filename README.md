@@ -4,11 +4,13 @@ Transparent automatic backgrounding for OpenCode subagents. Zero API changes —
 
 ## What it does
 
-Two features on the `event` hook:
+Three features on the `event` hook:
 
 1. **Auto-background** (`session.created`) — when architect spawns a child subagent, this plugin polls until the child is busy, then calls `POST /experimental/session/<parentID>/background`. The parent goes idle immediately and the turn returns to the user. No more "delegating task..." hanging.
 
-2. **Wake safety net** (`session.idle`) — in ~3% of cases the native OpenCode wake fails to deliver the `<task_result>` back to the parent — or delivers it but the parent turn dies silently mid-step (step-finish reason="unknown", anomalyco#33066/#21524). This watchdog detects both gaps: it verifies the parent actually completed a turn after delivery (not just that the result is in the timeline), and re-wakes via the sync /session/:id/message route (prompt_async is unreliable for idle sessions) with the parent's previous model to preserve prompt cache.
+2. **Wake safety net** (`session.idle` on a child) — in ~3% of cases the native OpenCode wake fails to deliver the `<task_result>` back to the parent, or delivers it but the parent turn dies silently. This watchdog verifies the parent actually completed a turn after delivery, then re-wakes via the sync `/session/:id/message` route with the parent's previous model to preserve prompt cache.
+
+3. **TODO-sync nudge** (`session.idle` on a TOP-LEVEL architect session) — STATE-BASED since v1.2.0: reads the real TODO via `GET /session/{id}/todo` and, if any task is still `in_progress` when the session goes idle, injects a reminder to sync it. This turns the "TODO updated at the end of every turn" rule into a mechanical trigger instead of self-discipline. Guarded: no nudge while a subagent delegation is in flight (in_progress is legit then), and no nudge if the last turn already called `todowrite` (convergence). A 2-min cooldown prevents loops.
 
 ## Install
 
@@ -48,11 +50,8 @@ The plugin auto-detects sessions whose parent agent is `"architect"`. To target 
 ## How it works
 
 - `session.created` → polls child status every 200ms up to 10s. When the child becomes "busy", backgrounds the parent.
-- `session.idle` on a child → watches the parent for 5 minutes. If the parent stays idle without processing the task result, verifies the parent actually completed its turn after delivery (liveness, not just delivery) and sends a wake message via the sync /message route, reusing the parent's last model to preserve prompt cache.
-
-## TUI vs OpenChamber
-
-In the TUI you can press `Ctrl+B` to manually background a subagent. OpenChamber (mobile/web client) has no such shortcut — without this plugin, every delegation blocks the interface until the subagent completes. If you use OpenChamber, auto-bg is essential; if you use the TUI, it's a convenient automation of what you'd do manually.
+- `session.idle` on a child → watches the parent for 5 minutes. If the parent stays idle without processing the task result, sends a wake message reusing the parent's last model to preserve prompt cache.
+- `session.idle` (top-level architect) → reads `/session/{id}/todo`; if any task is `in_progress` (and no child delegation is busy, and the last turn didn't already call `todowrite`), injects a synthetic nudge via /message (same model-preservation rule).
 
 ## Why?
 
